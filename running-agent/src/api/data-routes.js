@@ -3,12 +3,14 @@ import { createHash } from "node:crypto";
 import {
   corosActivityCount,
   createImport,
+  deleteActivity,
   deleteImport,
   finishImport,
   getActivity,
   listActivities,
   listImports,
   removeDemoActivities,
+  renameActivity,
   resetDemoData,
   saveActivities
 } from "../db.js";
@@ -61,6 +63,29 @@ export function registerDataRoutes(app, { asyncRoute, httpError, upload }) {
       throw httpError(404, "ACTIVITY_NOT_FOUND", "找不到这条训练记录");
     }
     response.json({ activity });
+  });
+
+  app.patch("/api/activities/:id", (request, response) => {
+    const title = String(request.body?.title || "").trim();
+    if (!title) {
+      throw httpError(400, "ACTIVITY_TITLE_REQUIRED", "请输入训练名称");
+    }
+    if (title.length > 80) {
+      throw httpError(400, "ACTIVITY_TITLE_TOO_LONG", "训练名称不能超过 80 个字符");
+    }
+    const activity = renameActivity(request.params.id, title);
+    if (!activity) {
+      throw httpError(404, "ACTIVITY_NOT_FOUND", "找不到这条训练记录");
+    }
+    response.json({ activity });
+  });
+
+  app.delete("/api/activities/:id", (request, response) => {
+    const result = deleteActivity(request.params.id);
+    if (!result) {
+      throw httpError(404, "ACTIVITY_NOT_FOUND", "找不到这条训练记录");
+    }
+    response.json(result);
   });
 
   app.get("/api/sources", (request, response) => {

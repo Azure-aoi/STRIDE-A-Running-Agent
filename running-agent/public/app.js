@@ -81,7 +81,15 @@ const state = {
   calendarStart: null,
   calendarSessions: [],
   planPreviews: new Map(),
-  pendingPlanPreview: null
+  pendingPlanPreview: null,
+  actionResolver: null,
+  activityFilters: {
+    query: "",
+    distance: "all",
+    source: "all",
+    sort: "latest"
+  },
+  compareActivityIds: []
 };
 
 function loadModelConfig() {
@@ -146,6 +154,172 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function renderInlineMarkdown(value) {
+  return escapeHtml(value)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+}
+
+function renderMarkdown(value) {
+  const lines = String(value ?? "").replaceAll("\r\n", "\n").split("\n");
+  const output = [];
+  let index = 0;
+  let paragraph = [];
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    output.push(
+      `<p>${paragraph.map((line) => renderInlineMarkdown(line)).join("<br>")}</p>`
+    );
+    paragraph = [];
+  };
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushParagraph();
+      index += 1;
+      continue;
+    }
+
+    if (trimmed.startsWith("```")) {
+      flushParagraph();
+      const code = [];
+      index += 1;
+      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      index += 1;
+      output.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+      continue;
+    }
+
+    const heading = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      const level = Math.min(4, heading[1].length + 2);
+      output.push(
+        `<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`
+      );
+      index += 1;
+      continue;
+    }
+
+    if (
+      trimmed.includes("|") &&
+      index + 1 < lines.length &&
+      /^\s*\|?\s*:?-{3,}/.test(lines[index + 1])
+    ) {
+      flushParagraph();
+      const parseCells = (row) =>
+        row
+          .trim()
+          .replace(/^\|/, "")
+          .replace(/\|$/, "")
+          .split("|")
+          .map((cell) => cell.trim());
+      const headers = parseCells(line);
+      index += 2;
+      const rows = [];
+      while (
+        index < lines.length &&
+        lines[index].trim() &&
+        lines[index].includes("|")
+      ) {
+        rows.push(parseCells(lines[index]));
+        index += 1;
+      }
+      output.push(`
+        <div class="chat-table-wrap">
+          <table>
+            <thead><tr>${headers
+              .map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`)
+              .join("")}</tr></thead>
+            <tbody>${rows
+              .map(
+                (row) =>
+                  `<tr>${headers
+                    .map(
+                      (_, cellIndex) =>
+                        `<td>${renderInlineMarkdown(row[cellIndex] || "")}</td>`
+                    )
+                    .join("")}</tr>`
+              )
+              .join("")}</tbody>
+          </table>
+        </div>`);
+      continue;
+    }
+
+    const unordered = trimmed.match(/^[-*+]\s+(.+)$/);
+    const ordered = trimmed.match(/^\d+\.\s+(.+)$/);
+    if (unordered || ordered) {
+      flushParagraph();
+      const tag = unordered ? "ul" : "ol";
+      const matcher = unordered ? /^[-*+]\s+(.+)$/ : /^\d+\.\s+(.+)$/;
+      const items = [];
+      while (index < lines.length) {
+        const item = lines[index].trim().match(matcher);
+        if (!item) break;
+        items.push(`<li>${renderInlineMarkdown(item[1])}</li>`);
+        index += 1;
+      }
+      output.push(`<${tag}>${items.join("")}</${tag}>`);
+      continue;
+    }
+
+    if (trimmed.startsWith(">")) {
+      flushParagraph();
+      const quotes = [];
+      while (index < lines.length && lines[index].trim().startsWith(">")) {
+        quotes.push(lines[index].trim().replace(/^>\s?/, ""));
+        index += 1;
+      }
+      output.push(
+        `<blockquote>${quotes
+          .map((quote) => renderInlineMarkdown(quote))
+          .join("<br>")}</blockquote>`
+      );
+      continue;
+    }
+
+    if (/^---+$/.test(trimmed)) {
+      flushParagraph();
+      output.push("<hr>");
+      index += 1;
+      continue;
+    }
+
+    paragraph.push(line);
+    index += 1;
+  }
+  flushParagraph();
+  return output.join("");
+}
+
+function chatMessageMarkup(role, content, meta) {
+  const isUser = role === "user";
+  const body = isUser
+    ? escapeHtml(content).replaceAll("\n", "<br>")
+    : renderMarkdown(content);
+  return `
+    <div class="chat-bubble">${body}</div>
+    <div class="chat-meta-row">
+      <span class="chat-meta">${escapeHtml(
+        meta || (isUser ? "你" : "教练")
+      )}</span>
+      ${
+        isUser
+          ? ""
+          : `<button class="chat-copy" type="button" data-copy-message>复制</button>`
+      }
+    </div>`;
 }
 
 function formatPace(seconds) {
@@ -214,49 +388,65 @@ function routeKeyForPath(pathname) {
   return "dashboard";
 }
 
+function setActiveRail(key = null) {
+  const activePath = key === "activity" ? "/activities" : ROUTE_META[key]?.path;
+  $$(".rail-button[data-route]").forEach((button) => {
+    const active = Boolean(activePath && button.dataset.route === activePath);
+    button.classList.toggle("is-active", active);
+    if (active) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  });
+}
+
+function scrollToRoute(pathname, { behavior = "smooth" } = {}) {
+  if (!pathname || pathname === "/") {
+    window.scrollTo({ top: 0, behavior });
+    return;
+  }
+  const key = routeKeyForPath(pathname);
+  const sectionId =
+    key === "activity" ? "activity-detail-section" : `${key}-section`;
+  const target = document.getElementById(sectionId);
+  if (!target) return;
+  const top = Math.max(
+    0,
+    window.scrollY + target.getBoundingClientRect().top - 78
+  );
+  if (behavior !== "smooth") {
+    const root = document.documentElement;
+    const previousBehavior = root.style.scrollBehavior;
+    root.style.scrollBehavior = "auto";
+    window.scrollTo(0, top);
+    root.style.scrollBehavior = previousBehavior;
+    return;
+  }
+  window.scrollTo({ top, behavior });
+}
+
 function renderRouteHeading() {
   const meta = ROUTE_META[state.route];
   if (!meta) return;
-  $("#page-kicker").textContent = meta.kicker;
-  $("#page-title").textContent = meta.title;
-
-  let copy = "正在读取本地训练数据...";
-  if (state.route === "dashboard") {
-    copy = todayLabel();
-  } else if (state.route === "activities") {
-    const latest = state.activities[0];
-    copy = state.activities.length
-      ? `共 ${state.activities.length} 条记录${latest ? `，最近一次 ${formatDate(latest.startedAt, true)}` : ""}`
-      : "还没有跑步记录";
-  } else if (state.route === "activity") {
-    copy = state.activityDetail
-      ? activityTitle(state.activityDetail)
-      : "查看单次训练的距离、心率、轨迹和来源";
-  } else if (state.route === "calendar") {
-    copy = "查看本周训练安排、完成状态和训练反馈";
-  } else if (state.route === "coach" && state.dashboard) {
-    copy = `基于最近 ${state.dashboard.days} 天训练数据 · ${state.dashboard.current.runCount} 次跑步`;
-  }
-  $("#today-copy").textContent = copy;
+  $("#page-kicker").textContent = "训练管理";
+  $("#page-title").textContent = "训练总览";
+  $("#today-copy").textContent = state.dashboard
+    ? todayLabel()
+    : "正在读取本地训练数据...";
   document.title = `${meta.title} · STRIDE OS`;
 }
 
-function navigate(pathname, { push = true, replace = false, load = true } = {}) {
+function navigate(
+  pathname,
+  { push = true, replace = false, load = true, scroll = true } = {}
+) {
   const key = routeKeyForPath(pathname);
   const meta = ROUTE_META[key];
   state.route = key;
   state.activityDetailId = key === "activity" ? activityIdFromPath(pathname) : null;
   if (key !== "activity") state.activityDetail = null;
   $$(".route-view").forEach((view) => {
-    view.hidden = view.dataset.view !== key;
+    view.hidden = view.dataset.view === "activity" && key !== "activity";
   });
-  const activeRoute = key === "activity" ? "activities" : key;
-  $$(".rail-button[data-route]").forEach((button) => {
-    button.classList.toggle(
-      "is-active",
-      button.dataset.route === ROUTE_META[activeRoute]?.path
-    );
-  });
+  setActiveRail(key);
   renderRouteHeading();
   if (load && key === "activity") {
     loadActivityDetail().catch((error) => toast(error.message, "error"));
@@ -273,7 +463,181 @@ function navigate(pathname, { push = true, replace = false, load = true } = {}) 
     const url = key === "activity" ? pathname : meta.path;
     window.history[method]({}, "", url);
   }
-  window.scrollTo({ top: 0, behavior: "auto" });
+  if (scroll) {
+    window.requestAnimationFrame(() => scrollToRoute(pathname));
+  }
+}
+
+function syncActiveJourney() {
+  const sections = $$("[data-journey-section]");
+  const threshold = window.innerHeight * 0.42;
+  let active = null;
+  let closestDistance = Number.POSITIVE_INFINITY;
+  for (const section of sections) {
+    const rect = section.getBoundingClientRect();
+    const distance = Math.abs(rect.top - threshold);
+    if (rect.top <= threshold && distance < closestDistance) {
+      active = section.dataset.view;
+      closestDistance = distance;
+    }
+  }
+  setActiveRail(active);
+  const floatingAi = $("#go-coach");
+  if (floatingAi) {
+    floatingAi.classList.toggle(
+      "is-hidden",
+      !active || active === "coach" || active === "activity"
+    );
+  }
+}
+
+function initJourneyNavigation() {
+  let scheduled = false;
+  const schedule = () => {
+    if (scheduled) return;
+    scheduled = true;
+    window.requestAnimationFrame(() => {
+      scheduled = false;
+      syncActiveJourney();
+    });
+  };
+  window.addEventListener("scroll", schedule, { passive: true });
+  window.addEventListener("resize", schedule);
+  schedule();
+}
+
+function initHeroParticles() {
+  const canvas = $("#hero-particle-canvas");
+  const hero = $(".landing-hero");
+  if (!canvas || !hero) return;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+
+  const reducedMotion = window.matchMedia(
+    "(prefers-reduced-motion: reduce)"
+  ).matches;
+  const pointer = { x: 0, y: 0, active: false };
+  let width = 0;
+  let height = 0;
+  let dpr = 1;
+  let particles = [];
+  let frame = null;
+  let inView = true;
+
+  const buildParticles = () => {
+    const count = Math.max(44, Math.min(96, Math.round(width / 15)));
+    particles = Array.from({ length: count }, () => ({
+      x: Math.random() * width,
+      y: Math.random() * height,
+      vx: (Math.random() - 0.5) * 0.22,
+      vy: (Math.random() - 0.5) * 0.22,
+      size: Math.random() * 1.5 + 0.7,
+      phase: Math.random() * Math.PI * 2
+    }));
+  };
+
+  const resize = () => {
+    const rect = hero.getBoundingClientRect();
+    width = Math.max(1, rect.width);
+    height = Math.max(1, rect.height);
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    buildParticles();
+    cancelAnimationFrame(frame);
+    draw(performance.now());
+  };
+
+  const draw = (time) => {
+    context.clearRect(0, 0, width, height);
+    const maxConnection = width < 760 ? 92 : 124;
+    for (let index = 0; index < particles.length; index += 1) {
+      const particle = particles[index];
+      if (!reducedMotion && inView) {
+        particle.x += particle.vx;
+        particle.y += particle.vy;
+        if (particle.x < -12) particle.x = width + 12;
+        if (particle.x > width + 12) particle.x = -12;
+        if (particle.y < -12) particle.y = height + 12;
+        if (particle.y > height + 12) particle.y = -12;
+        if (pointer.active) {
+          const dx = particle.x - pointer.x;
+          const dy = particle.y - pointer.y;
+          const distance = Math.hypot(dx, dy);
+          if (distance > 0 && distance < 150) {
+            const force = (1 - distance / 150) * 0.2;
+            particle.x += (dx / distance) * force * 8;
+            particle.y += (dy / distance) * force * 8;
+          }
+        }
+      }
+
+      const pulse = 0.55 + Math.sin(time * 0.0013 + particle.phase) * 0.2;
+      context.beginPath();
+      context.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
+      context.fillStyle = `rgba(201, 248, 76, ${pulse})`;
+      context.fill();
+
+      for (let next = index + 1; next < particles.length; next += 1) {
+        const neighbor = particles[next];
+        const dx = particle.x - neighbor.x;
+        const dy = particle.y - neighbor.y;
+        const distance = Math.hypot(dx, dy);
+        if (distance > maxConnection) continue;
+        const alpha = (1 - distance / maxConnection) * 0.14;
+        context.beginPath();
+        context.moveTo(particle.x, particle.y);
+        context.lineTo(neighbor.x, neighbor.y);
+        context.strokeStyle = `rgba(158, 202, 177, ${alpha})`;
+        context.lineWidth = 0.7;
+        context.stroke();
+      }
+    }
+
+    if (pointer.active) {
+      for (const particle of particles) {
+        const distance = Math.hypot(particle.x - pointer.x, particle.y - pointer.y);
+        if (distance > 170) continue;
+        context.beginPath();
+        context.moveTo(particle.x, particle.y);
+        context.lineTo(pointer.x, pointer.y);
+        context.strokeStyle = `rgba(201, 248, 76, ${(1 - distance / 170) * 0.24})`;
+        context.lineWidth = 0.8;
+        context.stroke();
+      }
+    }
+
+    if (!reducedMotion && inView) frame = requestAnimationFrame(draw);
+  };
+
+  const handlePointerMove = (event) => {
+    const rect = hero.getBoundingClientRect();
+    pointer.x = event.clientX - rect.left;
+    pointer.y = event.clientY - rect.top;
+    pointer.active = true;
+  };
+
+  hero.addEventListener("pointermove", handlePointerMove);
+  hero.addEventListener("pointerleave", () => {
+    pointer.active = false;
+  });
+  new ResizeObserver(resize).observe(hero);
+  new IntersectionObserver(
+    ([entry]) => {
+      inView = entry.isIntersecting;
+      if (inView && !reducedMotion) {
+        cancelAnimationFrame(frame);
+        frame = requestAnimationFrame(draw);
+      } else if (!inView) {
+        cancelAnimationFrame(frame);
+      }
+    },
+    { threshold: 0.01 }
+  ).observe(hero);
+  resize();
 }
 
 function sourceLabel(provider) {
@@ -535,7 +899,7 @@ function renderChart() {
   const circles = points
     .map(
       (point, index) =>
-        `<circle class="chart-point${index === points.length - 1 ? " is-latest" : ""}" cx="${point.x}" cy="${point.y}" r="${index === points.length - 1 ? 4.2 : 2.8}"><title>${point.label}: ${point.value} km</title></circle>`
+        `<circle class="chart-point${index === points.length - 1 ? " is-latest" : ""}" cx="${point.x}" cy="${point.y}" r="${index === points.length - 1 ? 4.2 : 2.8}" tabindex="0" data-chart-x="${escapeHtml(point.label)}" data-chart-y="${point.value}" aria-label="${escapeHtml(point.label)}，${point.value} 公里"><title>${point.label}: ${point.value} km</title></circle>`
     )
     .join("");
 
@@ -547,20 +911,203 @@ function renderChart() {
       ${circles}
       ${labels}
     </svg>
+    <div class="chart-tooltip" id="chart-tooltip" hidden></div>
   `;
 }
 
+function getFilteredActivities() {
+  const { query, distance, source, sort } = state.activityFilters;
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = state.activities.filter((activity) => {
+    const km = Number(activity.distanceM) / 1000;
+    const searchable = [
+      activityTitle(activity),
+      formatDate(activity.startedAt, true),
+      sourceLabel(activity.provider),
+      activity.raw?.notes || ""
+    ]
+      .join(" ")
+      .toLowerCase();
+    if (normalizedQuery && !searchable.includes(normalizedQuery)) return false;
+    if (distance === "short" && km >= 5) return false;
+    if (distance === "middle" && (km < 5 || km > 10)) return false;
+    if (distance === "long" && km <= 10) return false;
+    if (source !== "all" && activity.provider !== source) return false;
+    return true;
+  });
+  return filtered.sort((left, right) => {
+    if (sort === "oldest") {
+      return new Date(left.startedAt) - new Date(right.startedAt);
+    }
+    if (sort === "distance") {
+      return Number(right.distanceM) - Number(left.distanceM);
+    }
+    if (sort === "pace") {
+      return (
+        (Number(left.avgPaceSecPerKm) || Number.POSITIVE_INFINITY) -
+        (Number(right.avgPaceSecPerKm) || Number.POSITIVE_INFINITY)
+      );
+    }
+    return new Date(right.startedAt) - new Date(left.startedAt);
+  });
+}
+
+function renderActivitySourceOptions() {
+  const select = $("#activity-source-filter");
+  if (!select) return;
+  const previous = state.activityFilters.source;
+  const providers = [...new Set(state.activities.map((activity) => activity.provider))];
+  select.innerHTML = `
+    <option value="all">全部来源</option>
+    ${providers
+      .map(
+        (provider) =>
+          `<option value="${escapeHtml(provider)}">${escapeHtml(sourceLabel(provider))}</option>`
+      )
+      .join("")}`;
+  select.value = providers.includes(previous) ? previous : "all";
+  state.activityFilters.source = select.value;
+}
+
+function renderActivityCompareSummary() {
+  const container = $("#activity-compare-summary");
+  if (!container) return;
+  const activities = state.compareActivityIds
+    .map((id) => state.activities.find((activity) => activity.id === id))
+    .filter(Boolean);
+  state.compareActivityIds = activities.map((activity) => activity.id);
+  renderActivityCompareGuide();
+  if (activities.length !== 2) {
+    container.hidden = true;
+    container.innerHTML = "";
+    return;
+  }
+  const [left, right] = activities;
+  const distanceDelta =
+    (Number(left.distanceM) - Number(right.distanceM)) / 1000;
+  const paceDelta =
+    Number(left.avgPaceSecPerKm) - Number(right.avgPaceSecPerKm);
+  const heartDelta =
+    Number(left.avgHeartRate || 0) - Number(right.avgHeartRate || 0);
+  const durationDelta =
+    Number(left.durationSec || 0) - Number(right.durationSec || 0);
+  const paceText =
+    Math.abs(paceDelta) < 1
+      ? "持平"
+      : `${paceDelta < 0 ? "快" : "慢"} ${formatDuration(Math.abs(paceDelta))}`;
+  container.innerHTML = `
+    <div class="compare-summary-head">
+      <div class="compare-summary-title">
+        <p class="panel-kicker">两次训练对比</p>
+        <div class="compare-run-pair">
+          <div>
+            <strong>${escapeHtml(activityTitle(left))}</strong>
+            <span>${escapeHtml(formatDate(left.startedAt, true))} · ${formatDuration(left.durationSec)}</span>
+          </div>
+          <em>对比</em>
+          <div>
+            <strong>${escapeHtml(activityTitle(right))}</strong>
+            <span>${escapeHtml(formatDate(right.startedAt, true))} · ${formatDuration(right.durationSec)}</span>
+          </div>
+        </div>
+      </div>
+      <button type="button" id="clear-activity-compare">清空对比</button>
+    </div>
+    <div class="compare-summary-grid">
+      <div><small>距离差</small><b>${distanceDelta >= 0 ? "+" : ""}${distanceDelta.toFixed(1)} km</b></div>
+      <div><small>配速差</small><b>${paceText}</b></div>
+      <div><small>心率差</small><b>${heartDelta >= 0 ? "+" : ""}${heartDelta || 0} bpm</b></div>
+      <div><small>时长差</small><b>${durationDelta >= 0 ? "+" : "-"}${formatDuration(Math.abs(durationDelta))}</b></div>
+    </div>`;
+  container.hidden = false;
+}
+
+function renderActivityCompareGuide() {
+  const count = state.compareActivityIds.length;
+  const copy = $("#activity-compare-guide-copy");
+  const counter = $("#activity-compare-guide-count");
+  const guide = $(".activity-compare-guide");
+  if (!copy || !counter || !guide) return;
+  counter.textContent = `${count} / 2`;
+  guide.classList.toggle("is-complete", count === 2);
+  copy.textContent =
+    count === 0
+      ? "勾选两条训练记录，查看距离、配速和心率差异。"
+      : count === 1
+        ? "已选择 1 条，再选择 1 条开始对比。"
+        : "已选择 2 条，下方显示两次训练的差异。";
+}
+
+function renderActivityMobileList(activities) {
+  const list = $("#activity-mobile-list");
+  if (!list) return;
+  if (!activities.length) {
+    list.innerHTML = `<p class="activity-empty-state">当前筛选条件下没有训练记录。</p>`;
+    return;
+  }
+  list.innerHTML = activities
+    .map(
+      (activity) => `
+      <article class="activity-mobile-card" data-activity-id="${escapeHtml(activity.id)}" tabindex="0">
+        <header>
+          <div>
+            <strong>${escapeHtml(activityTitle(activity))}</strong>
+            <small>${formatDate(activity.startedAt, true)} · ${escapeHtml(sourceLabel(activity.provider))}</small>
+          </div>
+          <label class="activity-compare-choice">
+            <input type="checkbox" data-compare-id="${escapeHtml(activity.id)}" ${state.compareActivityIds.includes(activity.id) ? "checked" : ""} />
+            对比
+          </label>
+        </header>
+        <dl>
+          <div><dt>距离</dt><dd>${(activity.distanceM / 1000).toFixed(1)} km</dd></div>
+          <div><dt>配速</dt><dd>${formatPace(activity.avgPaceSecPerKm)} /km</dd></div>
+          <div><dt>心率</dt><dd>${activity.avgHeartRate || "--"} bpm</dd></div>
+          <div><dt>负荷</dt><dd>${activity.trainingLoad || "--"}</dd></div>
+        </dl>
+        <div class="activity-mobile-actions">
+          <button type="button" data-activity-action="rename" data-activity-id="${escapeHtml(activity.id)}">
+            ${icon("edit")} 重命名
+          </button>
+          <button type="button" data-activity-action="delete" data-activity-id="${escapeHtml(activity.id)}">
+            ${icon("trash")} 删除
+          </button>
+        </div>
+      </article>`
+    )
+    .join("");
+}
+
 function renderActivities() {
+  renderActivitySourceOptions();
+  const activities = getFilteredActivities();
   const body = $("#activity-body");
   if (!state.activities.length) {
-    body.innerHTML = `<tr><td colspan="6"><div class="empty-activities">还没有跑步记录。上传文件后，训练数据会显示在这里。</div></td></tr>`;
+    body.innerHTML = `<tr><td colspan="8"><div class="empty-activities">还没有跑步记录。上传文件后，训练数据会显示在这里。</div></td></tr>`;
+    renderActivityMobileList([]);
+    renderActivityScatter([]);
+    renderActivityCompareSummary();
+    return;
+  }
+  $("#activity-count").textContent =
+    activities.length === state.activities.length
+      ? `${state.activities.length} 条记录`
+      : `${activities.length} / ${state.activities.length} 条记录`;
+  if (!activities.length) {
+    body.innerHTML = `<tr><td colspan="8"><div class="empty-activities">当前筛选条件下没有训练记录。</div></td></tr>`;
+    renderActivityMobileList([]);
+    renderActivityScatter([]);
+    renderActivityCompareSummary();
     return;
   }
 
-  body.innerHTML = state.activities
+  body.innerHTML = activities
     .map(
       (activity) => `
-      <tr class="activity-row" data-activity-id="${escapeHtml(activity.id)}" tabindex="0" role="link" aria-label="查看${escapeHtml(activityTitle(activity))}详情">
+      <tr class="activity-row" data-activity-id="${escapeHtml(activity.id)}" data-distance="${Number(activity.distanceM) / 1000}" data-pace="${Number(activity.avgPaceSecPerKm) || 0}" data-heart="${Number(activity.avgHeartRate) || 0}" data-load="${Number(activity.trainingLoad) || 0}" data-title="${escapeHtml(activityTitle(activity))}" data-date="${escapeHtml(formatDate(activity.startedAt, true))}" data-source="${escapeHtml(sourceLabel(activity.provider))}" tabindex="0" role="link" aria-label="查看${escapeHtml(activityTitle(activity))}详情">
+        <td class="compare-column">
+          <input class="activity-compare-toggle" type="checkbox" data-compare-id="${escapeHtml(activity.id)}" ${state.compareActivityIds.includes(activity.id) ? "checked" : ""} aria-label="选择${escapeHtml(activityTitle(activity))}进行对比" />
+        </td>
         <td>
           <div class="activity-name">
             <span class="activity-glyph">${icon("route")}</span>
@@ -575,9 +1122,288 @@ function renderActivities() {
         <td><span class="activity-number">${activity.avgHeartRate || "--"}</span> bpm</td>
         <td>${activity.trainingLoad || "--"}</td>
         <td><span class="source-badge">${sourceLabel(activity.provider)}</span></td>
+        <td class="activity-actions-column">
+          <div class="activity-row-actions">
+            <button type="button" data-activity-action="rename" data-activity-id="${escapeHtml(activity.id)}" title="重命名训练" aria-label="重命名${escapeHtml(activityTitle(activity))}">
+              ${icon("edit")}
+            </button>
+            <button type="button" data-activity-action="delete" data-activity-id="${escapeHtml(activity.id)}" title="删除训练" aria-label="删除${escapeHtml(activityTitle(activity))}">
+              ${icon("trash")}
+            </button>
+          </div>
+        </td>
       </tr>`
     )
     .join("");
+  renderActivityMobileList(activities);
+  renderActivityScatter(activities);
+  renderActivityCompareSummary();
+}
+
+function tooltipPosition(tooltip, target, host) {
+  if (!tooltip || !target || !host) return;
+  tooltip.hidden = false;
+  const targetRect = target.getBoundingClientRect();
+  const hostRect = host.getBoundingClientRect();
+  const positionRect = tooltip.offsetParent?.getBoundingClientRect() || hostRect;
+  const width = tooltip.offsetWidth || 280;
+  const height = tooltip.offsetHeight || 150;
+  const pointX = targetRect.left + targetRect.width / 2 - positionRect.left;
+  const pointY = targetRect.top - positionRect.top;
+  const edge = 10;
+  const left = Math.min(
+    Math.max(pointX, width / 2 + edge),
+    positionRect.width - width / 2 - edge
+  );
+  tooltip.dataset.placement = pointY < height + 22 ? "below" : "above";
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${pointY}px`;
+}
+
+function showTrendTooltip(target) {
+  const host = $("#load-chart");
+  const tooltip = $("#chart-tooltip");
+  if (!host || !tooltip || !target) return;
+  tooltip.innerHTML = `
+    <strong>${escapeHtml(target.dataset.chartY)} km</strong>
+    <small>${escapeHtml(target.dataset.chartX || "训练周")}</small>`;
+  tooltipPosition(tooltip, target, host);
+}
+
+function showActivityPointTooltip(target) {
+  const tooltip = $("#activity-chart-tooltip");
+  const host = $("#activity-scatter");
+  if (!tooltip || !host) return;
+  const activity = state.activities.find(
+    (item) => item.id === target.dataset.activityId
+  );
+  if (!activity) return;
+  tooltip.innerHTML = `
+    <div class="activity-tooltip-head">
+      <strong>${escapeHtml(activityTitle(activity))}</strong>
+      <small>${escapeHtml(formatDate(activity.startedAt, true))} · ${escapeHtml(sourceLabel(activity.provider))}</small>
+    </div>
+    <div class="activity-tooltip-metrics">
+      <div><small>距离 X</small><b>${(activity.distanceM / 1000).toFixed(1)} km</b></div>
+      <div><small>配速 Y</small><b>${formatPace(activity.avgPaceSecPerKm)} /km</b></div>
+      <div><small>平均心率</small><b>${activity.avgHeartRate || "--"} bpm</b></div>
+    </div>`;
+  tooltipPosition(tooltip, target, host);
+}
+
+function renderActivityScatter(sourceActivities = getFilteredActivities()) {
+  const container = $("#activity-scatter");
+  if (!container) return;
+  const activities = sourceActivities.filter(
+    (activity) =>
+      Number(activity.distanceM) > 0 && Number(activity.avgPaceSecPerKm) > 0
+  );
+  if (!activities.length) {
+    container.innerHTML = `<div class="empty-activities">当前筛选条件下没有可展示的距离与配速数据。</div>`;
+    return;
+  }
+
+  const width = 760;
+  const height = 250;
+  const left = 46;
+  const right = 22;
+  const top = 22;
+  const bottom = 42;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const distances = activities.map((activity) => activity.distanceM / 1000);
+  const paces = activities.map((activity) => activity.avgPaceSecPerKm);
+  const maxDistance = Math.max(5, Math.ceil(Math.max(...distances) / 2) * 2);
+  const minPace = Math.max(0, Math.floor(Math.min(...paces) / 15) * 15);
+  const maxPace = Math.ceil(Math.max(...paces) / 15) * 15;
+  const paceSpan = Math.max(15, maxPace - minPace);
+  const points = activities.map((activity) => ({
+    activity,
+    x: left + ((activity.distanceM / 1000) / maxDistance) * plotWidth,
+    y: top + ((activity.avgPaceSecPerKm - minPace) / paceSpan) * plotHeight
+  }));
+
+  const yGrid = [0, 0.5, 1]
+    .map((ratio) => {
+      const y = top + plotHeight * ratio;
+      const pace = minPace + paceSpan * ratio;
+      return `<line class="scatter-grid" x1="${left}" y1="${y}" x2="${width - right}" y2="${y}"></line>
+        <text class="scatter-axis" x="${left - 9}" y="${y + 3}" text-anchor="end">${formatPace(pace)}</text>`;
+    })
+    .join("");
+  const xGrid = [0, 0.5, 1]
+    .map((ratio) => {
+      const x = left + plotWidth * ratio;
+      return `<line class="scatter-grid" x1="${x}" y1="${top}" x2="${x}" y2="${top + plotHeight}"></line>
+        <text class="scatter-axis" x="${x}" y="${height - 20}" text-anchor="middle">${(maxDistance * ratio).toFixed(0)} km</text>`;
+    })
+    .join("");
+
+  container.innerHTML = `
+    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="训练记录距离与配速散点图">
+      ${yGrid}
+      ${xGrid}
+      <text class="scatter-axis-title" x="8" y="12">配速</text>
+      <text class="scatter-axis-title" x="${width - 8}" y="${height - 2}" text-anchor="end">距离</text>
+      ${points
+        .map(
+          ({ activity, x, y }) =>
+            `<circle class="scatter-point" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5" tabindex="0" data-activity-id="${escapeHtml(activity.id)}" aria-label="${escapeHtml(activityTitle(activity))}，${(activity.distanceM / 1000).toFixed(1)} 公里，配速 ${formatPace(activity.avgPaceSecPerKm)}"><title>${escapeHtml(activityTitle(activity))}</title></circle>`
+        )
+        .join("")}
+    </svg>`;
+}
+
+function showActivityHoverCard(row, event) {
+  const card = $("#activity-hover-card");
+  if (!card || !row) return;
+  const activityId = row.dataset.activityId;
+  const contentChanged = card.dataset.activityId !== activityId;
+  if (!contentChanged) {
+    card.hidden = false;
+    moveActivityHoverCard(event);
+    return;
+  }
+  const distance = Number(row.dataset.distance) || 0;
+  const heartRate = Number(row.dataset.heart) || 0;
+  const load = Number(row.dataset.load) || 0;
+  const pace = Number(row.dataset.pace) || 0;
+
+  card.innerHTML = `
+    <div class="activity-tooltip-head">
+      <strong>${escapeHtml(row.dataset.title)}</strong>
+      <small>${escapeHtml(row.dataset.date)} · ${escapeHtml(row.dataset.source)}</small>
+    </div>
+    <div class="hover-data-grid">
+      <div><small>距离 X</small><b>${distance.toFixed(1)} km</b></div>
+      <div><small>配速 Y</small><b>${formatPace(pace)} /km</b></div>
+      <div><small>平均心率</small><b>${heartRate || "--"} bpm</b></div>
+      <div><small>训练负荷</small><b>${load || "--"}</b></div>
+    </div>`;
+  card.dataset.activityId = activityId;
+  card.hidden = false;
+  moveActivityHoverCard(event);
+}
+
+function moveActivityHoverCard(event) {
+  const card = $("#activity-hover-card");
+  if (!card || card.hidden || !event) return;
+  const margin = 16;
+  const gap = 18;
+  const width = card.offsetWidth || 310;
+  const height = card.offsetHeight || 210;
+  const left =
+    event.clientX + gap + width > window.innerWidth - margin
+      ? event.clientX - width - gap
+      : event.clientX + gap;
+  const top = Math.min(
+    Math.max(margin, event.clientY + gap),
+    window.innerHeight - height - margin
+  );
+  card.style.left = `${Math.max(margin, left)}px`;
+  card.style.top = `${top}px`;
+}
+
+function highlightActivity(activityId) {
+  $$("#activity-body .activity-row").forEach((row) => {
+    row.classList.toggle("is-hovered", row.dataset.activityId === activityId);
+  });
+  $$("#activity-scatter .scatter-point").forEach((point) => {
+    const isCurrent = point.dataset.activityId === activityId;
+    point.classList.toggle("is-hovered", isCurrent);
+    point.classList.toggle("is-dimmed", Boolean(activityId) && !isCurrent);
+  });
+}
+
+function clearActivityHighlight() {
+  highlightActivity(null);
+  const card = $("#activity-hover-card");
+  if (card) {
+    card.hidden = true;
+    delete card.dataset.activityId;
+  }
+}
+
+function toggleActivityComparison(activityId, checked) {
+  if (!activityId) return;
+  if (!checked) {
+    state.compareActivityIds = state.compareActivityIds.filter(
+      (id) => id !== activityId
+    );
+    renderActivities();
+    return;
+  }
+  if (state.compareActivityIds.includes(activityId)) return;
+  if (state.compareActivityIds.length >= 2) {
+    toast("一次只能对比两次训练，请先取消其中一项", "error");
+    renderActivities();
+    return;
+  }
+  state.compareActivityIds = [...state.compareActivityIds, activityId];
+  renderActivities();
+}
+
+async function renameActivityRecord(activityId) {
+  const activity = state.activities.find((item) => item.id === activityId);
+  if (!activity) return;
+  const title = await promptAction("修改这次训练在总览和记录列表中的显示名称。", {
+    kicker: "训练记录",
+    title: "重命名训练",
+    label: "训练名称",
+    value: activityTitle(activity),
+    confirmLabel: "保存名称"
+  });
+  if (!title || title === activityTitle(activity)) return;
+  if (title.length > 80) {
+    toast("训练名称不能超过 80 个字符", "error");
+    return;
+  }
+  try {
+    await api(`/api/activities/${encodeURIComponent(activityId)}`, {
+      method: "PATCH",
+      body: { title }
+    });
+    await refreshDashboard();
+    toast("训练名称已更新");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function deleteActivityRecord(activityId) {
+  const activity = state.activities.find((item) => item.id === activityId);
+  if (!activity) return;
+  const confirmed = await confirmAction(
+    `将删除“${activityTitle(activity)}”这条训练记录。${
+      activity.provider === "coros"
+        ? "之后再次同步高驰时，这条记录可能重新出现。"
+        : ""
+    }`,
+    {
+      kicker: "训练记录",
+      title: "删除这条训练？",
+      confirmLabel: "删除记录",
+      danger: true
+    }
+  );
+  if (!confirmed) return;
+  try {
+    await api(`/api/activities/${encodeURIComponent(activityId)}`, {
+      method: "DELETE"
+    });
+    state.compareActivityIds = state.compareActivityIds.filter(
+      (id) => id !== activityId
+    );
+    if (state.activityDetailId === activityId) {
+      state.activityDetail = null;
+      navigate("/activities", { push: false });
+    }
+    await refreshDashboard();
+    await loadCorosStatus().catch(() => {});
+    toast("训练记录已删除");
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
 function formatDuration(seconds) {
@@ -857,11 +1683,17 @@ async function createNewSession() {
 async function renameSession(sessionId) {
   const session = state.sessions.find((item) => item.id === sessionId);
   if (!session) return;
-  const title = window.prompt("新的会话名称", session.title);
-  if (!title?.trim()) return;
+  const title = await promptAction("给这段训练对话一个更容易辨认的名称。", {
+    kicker: "对话历史",
+    title: "重命名会话",
+    label: "会话名称",
+    value: session.title,
+    confirmLabel: "保存名称"
+  });
+  if (!title) return;
   const data = await api(`/api/sessions/${encodeURIComponent(sessionId)}`, {
     method: "PATCH",
-    body: { title: title.trim() }
+    body: { title }
   });
   Object.assign(session, data.session);
   renderSessions();
@@ -872,7 +1704,16 @@ async function removeSession(sessionId) {
     toast("当前回答正在运行，请先等待完成或停止运行", "error");
     return;
   }
-  if (!window.confirm("删除这个会话及其中的对话记录？")) return;
+  if (
+    !(await confirmAction("会话及其中的对话记录会从本机删除，此操作无法撤销。", {
+      kicker: "对话历史",
+      title: "删除这个会话？",
+      confirmLabel: "删除会话",
+      danger: true
+    }))
+  ) {
+    return;
+  }
   await api(`/api/sessions/${encodeURIComponent(sessionId)}`, {
     method: "DELETE"
   });
@@ -901,6 +1742,7 @@ async function loadCalendar(startDate = null) {
 
 function renderCalendar(start, end) {
   const weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+  const todayKey = isoDate(new Date());
   const byDate = new Map(
     state.calendarSessions.map((session) => [session.date, session])
   );
@@ -913,8 +1755,9 @@ function renderCalendar(start, end) {
       const dateKey = isoDate(date);
       const session = byDate.get(dateKey);
       const workout = session?.workout || null;
+      const isToday = dateKey === todayKey;
       return `
-        <article class="calendar-day${session ? " has-session" : ""}" data-calendar-date="${dateKey}">
+        <article class="calendar-day${session ? " has-session" : ""}${isToday ? " is-today" : ""}" data-calendar-date="${dateKey}">
           <header>
             <span>${label}</span>
             <strong>${date.getMonth() + 1}/${date.getDate()}</strong>
@@ -1093,7 +1936,19 @@ async function inspectCoros() {
 }
 
 async function disconnectCorosAccount() {
-  if (!window.confirm("断开高驰连接并清除本地 OAuth 令牌？已同步的活动会保留。")) return;
+  if (
+    !(await confirmAction(
+      "断开后会清除本机保存的高驰 OAuth 令牌，已同步到工作台的跑步记录会保留。",
+      {
+        kicker: "高驰连接",
+        title: "断开高驰账号？",
+        confirmLabel: "断开连接",
+        danger: true
+      }
+    ))
+  ) {
+    return;
+  }
   try {
     await api("/api/coros/connection", { method: "DELETE" });
     $("#coros-tool-summary").hidden = true;
@@ -1120,8 +1975,11 @@ function renderChatMessages(messages = []) {
     .map(
       (message) => `
       <article class="chat-message is-${message.role === "user" ? "user" : "assistant"}">
-        <div class="chat-bubble">${escapeHtml(message.content)}</div>
-        <span class="chat-meta">${message.role === "user" ? "你" : escapeHtml(message.modelLabel || "教练")}</span>
+        ${chatMessageMarkup(
+          message.role,
+          message.content,
+          message.role === "user" ? "你" : message.modelLabel || "教练"
+        )}
       </article>`
     )
     .join("");
@@ -1153,9 +2011,7 @@ function appendChatMessage(role, content, meta = "", options = {}) {
   $("#chat-empty")?.remove();
   const article = document.createElement("article");
   article.className = `chat-message is-${role}`;
-  article.innerHTML = `
-    <div class="chat-bubble">${escapeHtml(content)}</div>
-    <span class="chat-meta">${escapeHtml(meta || (role === "user" ? "你" : "教练"))}</span>`;
+  article.innerHTML = chatMessageMarkup(role, content, meta);
   stream.append(article);
   scrollChatToBottom(false, wasNearBottom);
   return article;
@@ -1173,6 +2029,28 @@ function appendTyping() {
     <span class="chat-meta">${escapeHtml(activeModelLabel())}</span>`;
   stream.append(article);
   scrollChatToBottom(false, wasNearBottom);
+}
+
+async function copyChatMessage(button) {
+  const message = button.closest(".chat-message");
+  const content = message?.querySelector(".chat-bubble")?.innerText || "";
+  if (!content) return;
+  try {
+    await navigator.clipboard.writeText(content);
+  } catch {
+    const textarea = document.createElement("textarea");
+    textarea.value = content;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.append(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    textarea.remove();
+  }
+  button.textContent = "已复制";
+  window.setTimeout(() => {
+    button.textContent = "复制";
+  }, 1600);
 }
 
 function readModelForm() {
@@ -1362,21 +2240,20 @@ async function editMemory(id) {
   const memoryData = await api("/api/memory");
   const memory = memoryData.memories.find((item) => item.id === id);
   if (!memory) return;
-  const content = window.prompt("修改记忆内容", memory.content);
-  if (!content?.trim()) return;
-  const importanceText = window.prompt("重要性，0 到 1", String(memory.importance));
-  if (importanceText === null) return;
-  const typeLabel = window.prompt(
-    "记忆类型：profile、goal、preference、injury、decision",
-    memory.type
-  );
-  if (typeLabel === null) return;
+  const content = await promptAction("修改这条长期记忆的内容，类型与重要度保持不变。", {
+    kicker: "长期记忆",
+    title: "编辑记忆",
+    label: "记忆内容",
+    value: memory.content,
+    confirmLabel: "保存记忆"
+  });
+  if (!content) return;
   await api(`/api/memory/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: {
-      content: content.trim(),
-      importance: Number(importanceText),
-      type: typeLabel.trim() || memory.type
+      content,
+      importance: memory.importance,
+      type: memory.type
     }
   });
   renderMemoryList((await api("/api/memory")).memories);
@@ -1384,7 +2261,16 @@ async function editMemory(id) {
 }
 
 async function removeMemory(id) {
-  if (!window.confirm("删除这条长期记忆？")) return;
+  if (
+    !(await confirmAction("这条记忆会从跑者档案中长期移除。", {
+      kicker: "长期记忆",
+      title: "删除这条记忆？",
+      confirmLabel: "删除记忆",
+      danger: true
+    }))
+  ) {
+    return;
+  }
   await api(`/api/memory/${encodeURIComponent(id)}`, { method: "DELETE" });
   renderMemoryList((await api("/api/memory")).memories);
   toast("记忆已删除");
@@ -1921,6 +2807,76 @@ function closeDialog(id) {
   if (dialog?.open) dialog.close();
 }
 
+function settleActionDialog(value) {
+  const resolve = state.actionResolver;
+  state.actionResolver = null;
+  closeDialog("action-dialog");
+  if (resolve) resolve(value);
+}
+
+function openActionDialog({
+  kicker = "操作确认",
+  title = "确认继续",
+  message = "",
+  confirmLabel = "确认",
+  danger = false,
+  input = null
+} = {}) {
+  if (state.actionResolver) settleActionDialog(null);
+  $("#action-kicker").textContent = kicker;
+  $("#action-title").textContent = title;
+  $("#action-message").textContent = message;
+  $("#action-confirm").textContent = confirmLabel;
+  $("#action-confirm").classList.toggle("is-danger", danger);
+  $("#action-symbol").classList.toggle("is-danger", danger);
+  const inputField = $("#action-input-field");
+  const inputElement = $("#action-input");
+  inputField.hidden = !input;
+  if (input) {
+    $("#action-input-label").textContent = input.label || "内容";
+    inputElement.value = input.value || "";
+    inputElement.placeholder = input.placeholder || "";
+  }
+  openDialog("action-dialog");
+  window.requestAnimationFrame(() => {
+    if (input) {
+      inputElement.focus();
+      inputElement.select();
+    } else {
+      $("#action-confirm").focus();
+    }
+  });
+  return new Promise((resolve) => {
+    state.actionResolver = resolve;
+  });
+}
+
+async function confirmAction(message, options = {}) {
+  const result = await openActionDialog({
+    kicker: options.kicker || "操作确认",
+    title: options.title || "确认继续",
+    message,
+    confirmLabel: options.confirmLabel || "确认",
+    danger: options.danger ?? false
+  });
+  return result === true;
+}
+
+async function promptAction(message, options = {}) {
+  const result = await openActionDialog({
+    kicker: options.kicker || "编辑内容",
+    title: options.title || "输入新内容",
+    message,
+    confirmLabel: options.confirmLabel || "保存",
+    input: {
+      label: options.label || "内容",
+      value: options.value || "",
+      placeholder: options.placeholder || ""
+    }
+  });
+  return typeof result === "string" ? result.trim() : "";
+}
+
 function selectFile(file) {
   if (!file) return;
   const extension = file.name.split(".").pop()?.toLowerCase();
@@ -2008,7 +2964,16 @@ async function handleUpload(event) {
 }
 
 async function deleteImport(id) {
-  if (!window.confirm("删除这次导入及其中的活动记录？")) return;
+  if (
+    !(await confirmAction("这次导入以及它生成的活动记录会被删除，此操作无法撤销。", {
+      kicker: "数据导入",
+      title: "删除这次导入？",
+      confirmLabel: "删除导入",
+      danger: true
+    }))
+  ) {
+    return;
+  }
   try {
     await api(`/api/imports/${encodeURIComponent(id)}`, { method: "DELETE" });
     toast("导入记录已删除");
@@ -2020,6 +2985,17 @@ async function deleteImport(id) {
 
 function bindEvents() {
   $("#auth-form").addEventListener("submit", submitAuthentication);
+  $("#action-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const inputField = $("#action-input-field");
+    settleActionDialog(inputField.hidden ? true : $("#action-input").value.trim());
+  });
+  $("#action-cancel").addEventListener("click", () => settleActionDialog(null));
+  $("#action-close").addEventListener("click", () => settleActionDialog(null));
+  $("#action-dialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    settleActionDialog(null);
+  });
   $("#open-model").addEventListener("click", openModelSettings);
   $("#rail-settings").addEventListener("click", openModelSettings);
   $("#coach-open-model").addEventListener("click", openModelSettings);
@@ -2098,6 +3074,7 @@ function bindEvents() {
     openDialog("upload-dialog");
   };
   $("#open-upload").addEventListener("click", openUpload);
+  $("#hero-upload").addEventListener("click", openUpload);
   $("#quick-upload").addEventListener("click", openUpload);
   $("#source-upload").addEventListener("click", openUpload);
   $("#upload-open-coros").addEventListener("click", () => {
@@ -2148,6 +3125,24 @@ function bindEvents() {
     });
   });
 
+  $("#load-chart").addEventListener("pointerover", (event) => {
+    const point = event.target.closest("[data-chart-x]");
+    if (point) showTrendTooltip(point);
+  });
+  $("#load-chart").addEventListener("pointerleave", () => {
+    const tooltip = $("#chart-tooltip");
+    if (tooltip) tooltip.hidden = true;
+  });
+  $("#load-chart").addEventListener("focusin", (event) => {
+    const point = event.target.closest("[data-chart-x]");
+    if (point) showTrendTooltip(point);
+  });
+  $("#load-chart").addEventListener("focusout", (event) => {
+    if ($("#load-chart").contains(event.relatedTarget)) return;
+    const tooltip = $("#chart-tooltip");
+    if (tooltip) tooltip.hidden = true;
+  });
+
   $("#chat-form").addEventListener("submit", (event) => {
     event.preventDefault();
     sendQuestion($("#chat-input").value);
@@ -2160,6 +3155,10 @@ function bindEvents() {
   });
   $("#chat-stream").addEventListener("scroll", () => {
     state.chatPinnedBottom = isChatNearBottom();
+  });
+  $("#chat-stream").addEventListener("click", (event) => {
+    const copy = event.target.closest("[data-copy-message]");
+    if (copy) copyChatMessage(copy).catch((error) => toast(error.message, "error"));
   });
   $("#suggestion-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-question]");
@@ -2185,9 +3184,15 @@ function bindEvents() {
 
   $("#reset-demo").addEventListener("click", async () => {
     if (
-      !window.confirm(
-        "重置演示数据会删除当前所有活动和导入记录，但保留会话、长期记忆和跑者档案。继续吗？"
-      )
+      !(await confirmAction(
+        "当前所有活动和导入记录会被删除，但会话、长期记忆和跑者档案会保留。",
+        {
+          kicker: "演示数据",
+          title: "恢复演示数据？",
+          confirmLabel: "恢复演示数据",
+          danger: true
+        }
+      ))
     ) {
       return;
     }
@@ -2244,11 +3249,112 @@ function bindEvents() {
     });
   });
 
+  $("#activity-search").addEventListener("input", (event) => {
+    state.activityFilters.query = event.target.value;
+    renderActivities();
+  });
+  $("#activity-distance-filter").addEventListener("change", (event) => {
+    state.activityFilters.distance = event.target.value;
+    renderActivities();
+  });
+  $("#activity-source-filter").addEventListener("change", (event) => {
+    state.activityFilters.source = event.target.value;
+    renderActivities();
+  });
+  $("#activity-sort").addEventListener("change", (event) => {
+    state.activityFilters.sort = event.target.value;
+    renderActivities();
+  });
+  $("#activity-reset").addEventListener("click", () => {
+    state.activityFilters = {
+      query: "",
+      distance: "all",
+      source: "all",
+      sort: "latest"
+    };
+    $("#activity-search").value = "";
+    $("#activity-distance-filter").value = "all";
+    $("#activity-source-filter").value = "all";
+    $("#activity-sort").value = "latest";
+    renderActivities();
+  });
+  $("#activity-body").addEventListener("change", (event) => {
+    const checkbox = event.target.closest("[data-compare-id]");
+    if (!checkbox) return;
+    toggleActivityComparison(checkbox.dataset.compareId, checkbox.checked);
+  });
+  $("#activity-mobile-list").addEventListener("change", (event) => {
+    const checkbox = event.target.closest("[data-compare-id]");
+    if (!checkbox) return;
+    event.stopPropagation();
+    toggleActivityComparison(checkbox.dataset.compareId, checkbox.checked);
+  });
+  $("#activity-mobile-list").addEventListener("click", (event) => {
+    const action = event.target.closest("[data-activity-action]");
+    if (action) {
+      event.stopPropagation();
+      const handler =
+        action.dataset.activityAction === "rename"
+          ? renameActivityRecord
+          : deleteActivityRecord;
+      handler(action.dataset.activityId).catch((error) =>
+        toast(error.message, "error")
+      );
+      return;
+    }
+    if (event.target.closest(".activity-compare-choice")) return;
+    const card = event.target.closest("[data-activity-id]");
+    if (card) navigate(`/activities/${encodeURIComponent(card.dataset.activityId)}`);
+  });
+  $("#activity-compare-summary").addEventListener("click", (event) => {
+    if (!event.target.closest("#clear-activity-compare")) return;
+    state.compareActivityIds = [];
+    renderActivities();
+  });
   $("#activity-body").addEventListener("click", (event) => {
+    const action = event.target.closest("[data-activity-action]");
+    if (action) {
+      const handler =
+        action.dataset.activityAction === "rename"
+          ? renameActivityRecord
+          : deleteActivityRecord;
+      handler(action.dataset.activityId).catch((error) =>
+        toast(error.message, "error")
+      );
+      return;
+    }
+    if (event.target.closest(".compare-column")) return;
     const row = event.target.closest("[data-activity-id]");
     if (row) navigate(`/activities/${encodeURIComponent(row.dataset.activityId)}`);
   });
+  $("#activity-body").addEventListener("pointermove", (event) => {
+    if (event.target.closest(".compare-column, .activity-row-actions")) {
+      clearActivityHighlight();
+      return;
+    }
+    const row = event.target.closest(".activity-row");
+    if (!row) return;
+    highlightActivity(row.dataset.activityId);
+    showActivityHoverCard(row, event);
+  });
+  $("#activity-body").addEventListener("pointerleave", clearActivityHighlight);
+  $("#activity-body").addEventListener("focusin", (event) => {
+    if (event.target.closest(".compare-column, .activity-row-actions")) {
+      clearActivityHighlight();
+      return;
+    }
+    const row = event.target.closest(".activity-row");
+    if (!row) return;
+    const rect = row.getBoundingClientRect();
+    highlightActivity(row.dataset.activityId);
+    showActivityHoverCard(row, {
+      clientX: rect.right - 24,
+      clientY: rect.top + Math.min(32, rect.height / 2)
+    });
+  });
+  $("#activity-body").addEventListener("focusout", clearActivityHighlight);
   $("#activity-body").addEventListener("keydown", (event) => {
+    if (event.target.matches("input, button")) return;
     if (event.key !== "Enter" && event.key !== " ") return;
     const row = event.target.closest("[data-activity-id]");
     if (!row) return;
@@ -2256,28 +3362,65 @@ function bindEvents() {
     navigate(`/activities/${encodeURIComponent(row.dataset.activityId)}`);
   });
   $("#activity-back").addEventListener("click", () => navigate("/activities"));
-
-  $("#go-coach").addEventListener("click", () => navigate("/coach"));
+  $("#activity-scatter").addEventListener("pointerover", (event) => {
+    const point = event.target.closest(".scatter-point");
+    if (!point) return;
+    highlightActivity(point.dataset.activityId);
+    showActivityPointTooltip(point);
+  });
+  $("#activity-scatter").addEventListener("pointerleave", () => {
+    const tooltip = $("#activity-chart-tooltip");
+    if (tooltip) tooltip.hidden = true;
+    clearActivityHighlight();
+  });
+  $("#activity-scatter").addEventListener("focusin", (event) => {
+    const point = event.target.closest(".scatter-point");
+    if (!point) return;
+    highlightActivity(point.dataset.activityId);
+    showActivityPointTooltip(point);
+  });
+  $("#activity-scatter").addEventListener("focusout", () => {
+    const tooltip = $("#activity-chart-tooltip");
+    if (tooltip) tooltip.hidden = true;
+    clearActivityHighlight();
+  });
+  $("#activity-scatter").addEventListener("click", (event) => {
+    const point = event.target.closest(".scatter-point");
+    if (point) navigate(`/activities/${encodeURIComponent(point.dataset.activityId)}`);
+  });
   window.addEventListener("popstate", () => navigate(window.location.pathname, { push: false }));
 }
 
 async function boot() {
   bindEvents();
+  initHeroParticles();
+  initJourneyNavigation();
   updateModelUI();
+  const initialPath = window.location.pathname;
   try {
     if (!(await checkAuthentication())) {
-      navigate(window.location.pathname, {
+      navigate(initialPath, {
         push: false,
-        replace: window.location.pathname === "/",
-        load: false
+        replace: false,
+        load: false,
+        scroll: false
       });
+      syncActiveJourney();
       return;
     }
-    navigate(window.location.pathname, {
+    navigate(initialPath, {
       push: false,
-      replace: window.location.pathname === "/"
+      replace: false,
+      scroll: false
     });
     await loadAll();
+    if (initialPath !== "/") {
+      window.requestAnimationFrame(() =>
+        scrollToRoute(initialPath, { behavior: "auto" })
+      );
+    } else {
+      syncActiveJourney();
+    }
     const params = new URLSearchParams(window.location.search);
     const corosResult = params.get("coros");
     if (corosResult === "connected") {
